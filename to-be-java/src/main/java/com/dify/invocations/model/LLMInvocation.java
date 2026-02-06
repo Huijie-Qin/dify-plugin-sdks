@@ -1,0 +1,125 @@
+package com.dify.invocations.model;
+
+import com.dify.core.entities.invocation.InvokeType;
+import com.dify.core.runtime.BackwardsInvocation;
+import com.dify.entities.model.llm.LLMModelConfig;
+import com.dify.entities.model.llm.LLMResult;
+import com.dify.entities.model.llm.LLMResultChunk;
+import com.dify.entities.model.llm.LLMUsage;
+import com.dify.entities.model.message.AssistantPromptMessage;
+import com.dify.entities.model.message.PromptMessage;
+import com.dify.entities.model.message.PromptMessageTool;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+
+/**
+ * LLM 反向调用封装。
+ */
+public class LLMInvocation extends BackwardsInvocation<LLMResultChunk> {
+
+    private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
+
+    /**
+     * 调用 LLM。
+     *
+     * @param modelConfig 模型配置
+     * @param promptMessages prompt 消息列表
+     * @param tools 工具列表（可选）
+     * @param stop stop 列表（可选）
+     * @param stream 是否流式返回
+     * @return stream=true 时返回流；否则返回完整结果
+     */
+    public Object invoke(
+        LLMModelConfig modelConfig,
+        List<PromptMessage> promptMessages,
+        List<PromptMessageTool> tools,
+        List<String> stop,
+        boolean stream
+    ) {
+        if (stream) {
+            return invokeStreaming(modelConfig, promptMessages, tools, stop);
+        }
+        return invokeBlocking(modelConfig, promptMessages, tools, stop);
+    }
+
+    /**
+     * streaming 模式：直接返回结果流。
+     */
+    public Iterable<LLMResultChunk> invokeStreaming(
+        LLMModelConfig modelConfig,
+        List<PromptMessage> promptMessages,
+        List<PromptMessageTool> tools,
+        List<String> stop
+    ) {
+        Map<String, Object> data = buildPayload(modelConfig, promptMessages, tools, stop, true);
+        return backwardsInvoke(InvokeType.LLM, LLMResultChunk.class, data);
+    }
+
+    /**
+     * blocking 模式：将 stream 结果合并为完整 LLMResult。
+     */
+    public LLMResult invokeBlocking(
+        LLMModelConfig modelConfig,
+        List<PromptMessage> promptMessages,
+        List<PromptMessageTool> tools,
+        List<String> stop
+    ) {
+        Map<String, Object> data = buildPayload(modelConfig, promptMessages, tools, stop, false);
+
+        LLMResult result = new LLMResult(
+            modelConfig.getModel(),
+            new AssistantPromptMessage(""),
+            LLMUsage.emptyUsage()
+        );
+
+        for (LLMResultChunk llmResult : backwardsInvoke(InvokeType.LLM, LLMResultChunk.class, data)) {
+            if (llmResult.getDelta().getMessage().getContent() instanceof String) {
+                String current = result.getMessage().getContent();
+                result.getMessage().setContent(current + llmResult.getDelta().getMessage().getContent());
+            }
+            if (!llmResult.getDelta().getMessage().getToolCalls().isEmpty()) {
+                result.getMessage().setToolCalls(llmResult.getDelta().getMessage().getToolCalls());
+            }
+            if (llmResult.getDelta().getUsage() != null) {
+                result.getUsage().setPromptTokens(result.getUsage().getPromptTokens()
+                    + llmResult.getDelta().getUsage().getPromptTokens());
+                result.getUsage().setCompletionTokens(result.getUsage().getCompletionTokens()
+                    + llmResult.getDelta().getUsage().getCompletionTokens());
+                result.getUsage().setTotalTokens(result.getUsage().getTotalTokens()
+                    + llmResult.getDelta().getUsage().getTotalTokens());
+
+                result.getUsage().setCompletionPrice(llmResult.getDelta().getUsage().getCompletionPrice());
+                result.getUsage().setPromptPrice(llmResult.getDelta().getUsage().getPromptPrice());
+                result.getUsage().setTotalPrice(llmResult.getDelta().getUsage().getTotalPrice());
+                result.getUsage().setCurrency(llmResult.getDelta().getUsage().getCurrency());
+                result.getUsage().setLatency(llmResult.getDelta().getUsage().getLatency());
+            }
+        }
+
+        return result;
+    }
+
+    /**
+     * 构建请求 payload。
+     */
+    private Map<String, Object> buildPayload(
+        LLMModelConfig modelConfig,
+        List<PromptMessage> promptMessages,
+        List<PromptMessageTool> tools,
+        List<String> stop,
+        boolean stream
+    ) {
+        Map<String, Object> data = OBJECT_MAPPER.convertValue(modelConfig, Map.class);
+        data.put("prompt_messages", promptMessages.stream()
+            .map(message -> OBJECT_MAPPER.convertValue(message, Map.class))
+            .collect(Collectors.toList()));
+        data.put("tools", tools == null ? null : tools.stream()
+            .map(tool -> OBJECT_MAPPER.convertValue(tool, Map.class))
+            .collect(Collectors.toList()));
+        data.put("stop", stop);
+        data.put("stream", stream);
+        return data;
+    }
+}
